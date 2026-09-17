@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: dsa-leave-pass
+    runtime: node
+    region: frankfurt
+    plan: 0.5c-512mb
+    numInstances: 1
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/setup
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: HOST
+        value: 0.0.0.0
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /var/data/dsa.sqlite
+      - key: COOKIE_SECURE
+        value: "true"
+    disk:
+      name: dsa-data
+      mountPath: /var/data
+      sizeGB: 1

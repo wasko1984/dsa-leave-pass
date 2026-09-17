@@ -1,0 +1,19 @@
+{
+  "name": "dsa-leave-pass",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node server/index.mjs",
+    "dev": "node --watch server/index.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check server/app.mjs && node --check server/workflow.mjs && node --check public/app.js && node --check public/signature.js"
+  },
+  "dependencies": {
+    "nodemailer": "^10.0.10",
+    "pdfkit": "^0.17.2"
+  }
+}

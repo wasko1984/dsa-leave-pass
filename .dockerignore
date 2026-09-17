@@ -1,0 +1,12 @@
+# Send only runtime source and required print assets to the image builder.
+**
+!Dockerfile
+!package.json
+!package-lock.json
+!server/
+!server/**
+!public/
+!public/**
+!all-forms/
+!all-forms/logo.JPG
+!all-forms/STAMP.jpg
