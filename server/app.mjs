@@ -32,7 +32,8 @@ export function createApp({ dbPath = fileURLToPath(new URL('../data/dsa.sqlite',
   function throttle(req, identity = 'setup') {
     const now = Date.now();
     for (const [key, item] of attempts) if (now > item.until) attempts.delete(key);
-    const key = `${req.socket.remoteAddress}:${identity}`, item = attempts.get(key) || { count: 0, until: now + 15 * 60000 };
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || '127.0.0.1';
+    const key = `${ip}:${identity}`, item = attempts.get(key) || { count: 0, until: now + 15 * 60000 };
     requireThat(item.count < 20, 429, 'Too many attempts. Please try again in 15 minutes.'); item.count++; attempts.set(key, item);
     return () => attempts.delete(key);
   }

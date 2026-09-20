@@ -5,7 +5,8 @@ import { dirname } from 'node:path';
 export function openDatabase(path) {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
-  db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
+  try { db.exec('PRAGMA journal_mode=WAL;'); } catch { db.exec('PRAGMA journal_mode=DELETE;'); }
+  db.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE, password TEXT NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL, directorate TEXT NOT NULL, appointment TEXT NOT NULL, rank TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
     CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS applications (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES users(id), directorate TEXT NOT NULL, stage TEXT NOT NULL, version INTEGER NOT NULL, data TEXT NOT NULL);
