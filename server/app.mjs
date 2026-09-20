@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join, extname } from 'node:path';
 import { openDatabase, transaction, audit } from './db.mjs';
-import { clean, requireThat, HttpError, hashPassword, verifyPassword, tokenHash, publicUser, createSignedToken, verifySignedToken } from './security.mjs';
+import { clean, requireThat, HttpError, hashPassword, verifyPassword, tokenHash, publicUser } from './security.mjs';
 import { ROLES, getApplication, canView, present, saveApplication, decide, adminApplication } from './workflow.mjs';
 import { generatePDF } from './pdf.mjs';
 import { createRecovery, emailAddress } from './recovery.mjs';
@@ -18,45 +18,28 @@ export function createApp({ dbPath = fileURLToPath(new URL('../data/dsa.sqlite',
   const db = openDatabase(dbPath), attempts = new Map();
   const passwordRecovery = createRecovery(db, recovery);
   const send = (res, code, data) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(data)); };
+  
   function session(req, res, user) {
     db.prepare('DELETE FROM sessions WHERE expires<?').run(Date.now());
-    const expires = Date.now() + 8 * 3600000;
-    const payload = {
-      id: user.id, username: user.username, name: user.name, role: user.role,
-      directorate: user.directorate, appointment: user.appointment, rank: user.rank || '',
-      active: user.active ?? 1, must_change_password: user.must_change_password ?? 0,
-      email: user.email || '', expires
-    };
-    const token = createSignedToken(payload);
-    db.prepare('INSERT OR REPLACE INTO sessions(token,user_id,expires) VALUES(?,?,?)').run(tokenHash(token), user.id, expires);
+    const token = randomBytes(32).toString('hex');
+    db.prepare('INSERT INTO sessions(token,user_id,expires) VALUES(?,?,?)').run(tokenHash(token), user.id, Date.now() + 8 * 3600000);
     const isHttps = secureCookies || req.headers['x-forwarded-proto'] === 'https' || req.socket?.encrypted === true;
     res.setHeader('Set-Cookie', `dsa_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800${isHttps ? '; Secure' : ''}`);
     return token;
   }
+  
   function cookie(req) {
-    const auth = req.headers.authorization || '';
-    if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
-    const custom = req.headers['x-dsa-session'];
-    if (custom) return custom.trim();
     return (req.headers.cookie || '').split(';').map(v => v.trim()).find(v => v.startsWith('dsa_session='))?.slice(12) || '';
   }
+  
   function authenticate(req) {
-    const rawToken = cookie(req);
-    requireThat(rawToken, 401, 'Please sign in to continue.');
-    let user = db.prepare('SELECT u.* FROM users u JOIN sessions s ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND u.active=1').get(tokenHash(rawToken), Date.now());
-    if (!user) {
-      const payload = verifySignedToken(rawToken);
-      requireThat(payload && payload.id, 401, 'Please sign in to continue.');
-      user = db.prepare('SELECT * FROM users WHERE id=?').get(payload.id);
-      if (!user) {
-        db.prepare('INSERT OR REPLACE INTO users(id,username,password,name,role,directorate,appointment,rank,active,email,must_change_password) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
-          .run(payload.id, payload.username, 'SYNCED', payload.name, payload.role, payload.directorate, payload.appointment, payload.rank || '', payload.active ?? 1, payload.email || '', payload.must_change_password ?? 0);
-        user = db.prepare('SELECT * FROM users WHERE id=?').get(payload.id);
-      }
-      requireThat(user && user.active, 401, 'Please sign in to continue.');
-    }
+    const token = cookie(req);
+    requireThat(token, 401, 'Please sign in to continue.');
+    const user = db.prepare('SELECT u.* FROM users u JOIN sessions s ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND u.active=1').get(tokenHash(token), Date.now());
+    requireThat(user, 401, 'Please sign in to continue.');
     return user;
   }
+  
   function throttle(req, identity = 'setup') {
     const now = Date.now();
     for (const [key, item] of attempts) if (now > item.until) attempts.delete(key);
@@ -65,12 +48,14 @@ export function createApp({ dbPath = fileURLToPath(new URL('../data/dsa.sqlite',
     requireThat(item.count < 20, 429, 'Too many attempts. Please try again in 15 minutes.'); item.count++; attempts.set(key, item);
     return () => attempts.delete(key);
   }
+  
   async function body(req) {
     let size = 0, parts = [];
     for await (const chunk of req) { size += chunk.length; requireThat(size <= 5 * 1024 * 1024, 413, 'Request too large. Attachments must be under 3 MB.'); parts.push(chunk); }
     try { const data = JSON.parse(Buffer.concat(parts).toString() || '{}'); requireThat(data && typeof data === 'object' && !Array.isArray(data), 400, 'Invalid request.'); return data; }
     catch (e) { if (e.status) throw e; throw new HttpError(400, 'Invalid JSON request.'); }
   }
+  
   const server = http.createServer(async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'same-origin');
     res.setHeader('X-Frame-Options', 'DENY'); res.setHeader('Cache-Control', 'no-store');
@@ -88,13 +73,13 @@ export function createApp({ dbPath = fileURLToPath(new URL('../data/dsa.sqlite',
       if (writeMethods.includes(method)) {
         const origin = req.headers.origin;
         if (origin) {
+          let valid = false;
           try {
-            const originHost = new URL(origin).host;
-            const reqHost = req.headers['x-forwarded-host'] || req.headers.host;
-            requireThat(!reqHost || originHost === reqHost || reqHost.includes(originHost) || originHost.includes(reqHost), 403, 'This request must come from the application.');
-          } catch (err) {
-            if (err.status) throw err;
-          }
+            const u = new URL(origin);
+            const host = req.headers['x-forwarded-host'] || req.headers.host;
+            valid = (u.protocol === 'http:' || u.protocol === 'https:') && u.host === host;
+          } catch {}
+          requireThat(valid, 403, 'This request must come from the application.');
         }
         requireThat(req.headers['content-type']?.startsWith('application/json'), 415, 'Use JSON for this request.');
       }
@@ -105,17 +90,20 @@ export function createApp({ dbPath = fileURLToPath(new URL('../data/dsa.sqlite',
           requireThat(!db.prepare('SELECT id FROM users LIMIT 1').get(), 409, 'Setup is already complete. Please sign in.');
           const username = clean(input.username).toLowerCase(), name = clean(input.name);
           requireThat(/^[a-z0-9._-]{3,40}$/.test(username) && name, 400, 'Enter your name and a username of 3–40 letters, numbers, dots or underscores.');
-          const u = { id: randomUUID(), username, name, role: 'admin', directorate: 'Administration', appointment: 'System Administrator', rank: '', active: 1 };
-          db.prepare('INSERT INTO users(id,username,password,name,role,directorate,appointment,rank) VALUES(?,?,?,?,?,?,?,?)').run(u.id, username, hashPassword(input.password), name, u.role, u.directorate, u.appointment, '');
-          u.email = emailAddress(input.email); u.must_change_password = 0;
-          db.prepare('UPDATE users SET email=? WHERE id=?').run(u.email, u.id);
+          const email = emailAddress(input.email || `${username}@example.com`, true);
+          const u = { id: randomUUID(), username, name, role: 'admin', directorate: 'Administration', appointment: 'System Administrator', rank: '', active: 1, email, must_change_password: 0 };
+          db.prepare('INSERT INTO users(id,username,password,name,role,directorate,appointment,rank,email,must_change_password) VALUES(?,?,?,?,?,?,?,?,?,0)').run(u.id, username, hashPassword(input.password), name, u.role, u.directorate, u.appointment, '', email);
           audit(db, u, 'setup.complete', u.id); return u;
-        }); const token = session(req, res, user); return send(res, 201, { ...publicUser(user), token });
+        }); session(req, res, user); return send(res, 201, publicUser(user));
       }
       if (path === '/api/login' && method === 'POST') {
         const input = await body(req), username = clean(input.username).toLowerCase(), clearAttempts = throttle(req, 'login:' + username), u = db.prepare('SELECT * FROM users WHERE username=?').get(username);
         const valid = verifyPassword(input.password, u?.password || dummyHash);
-        requireThat(u && valid && u.active, 401, 'Incorrect username or password.'); clearAttempts(); const token = session(req, res, u); audit(db, u, 'session.login', u.id); return send(res, 200, { ...publicUser(u), token });
+        if (!u || !valid || !u.active) {
+          if (u) audit(db, u, 'session.login_failed', u.id, 'Invalid credentials');
+          requireThat(false, 401, 'Incorrect username or password.');
+        }
+        clearAttempts(); session(req, res, u); audit(db, u, 'session.login', u.id); return send(res, 200, publicUser(u));
       }
       if (path === '/api/forgot-password' && method === 'POST') {
         throttle(req, 'recovery'); const input = await body(req);
@@ -131,14 +119,25 @@ export function createApp({ dbPath = fileURLToPath(new URL('../data/dsa.sqlite',
       const user = authenticate(req);
       if (path === '/api/me' && method === 'GET') return send(res, 200, { user: publicUser(user), roles: ROLES });
       if (path === '/api/logout' && method === 'POST') {
-        db.prepare('DELETE FROM sessions WHERE token=?').run(tokenHash(cookie(req))); res.setHeader('Set-Cookie', 'dsa_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0'); return send(res, 200, { ok: true });
+        db.prepare('DELETE FROM sessions WHERE token=?').run(tokenHash(cookie(req)));
+        res.setHeader('Set-Cookie', 'dsa_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+        audit(db, user, 'session.logout', user.id);
+        return send(res, 200, { ok: true });
       }
       if (path === '/api/password' && method === 'POST') {
         const clearAttempts = throttle(req, 'password:' + user.id); const input = await body(req); requireThat(verifyPassword(input.currentPassword, user.password), 400, 'Current password is incorrect.');
         requireThat(!verifyPassword(input.newPassword, user.password), 400, 'Choose a new password different from the password you were given.');
         const next = hashPassword(input.newPassword);
-        transaction(db, () => { db.prepare('UPDATE users SET password=?,must_change_password=0 WHERE id=?').run(next, user.id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(user.id); db.prepare('DELETE FROM password_resets WHERE user_id=?').run(user.id); audit(db, user, 'user.password', user.id); });
-        clearAttempts(); const token = session(req, res, user); return send(res, 200, { ok: true, token });
+        transaction(db, () => {
+          db.prepare('UPDATE users SET password=?,must_change_password=0 WHERE id=?').run(next, user.id);
+          db.prepare('DELETE FROM sessions WHERE user_id=?').run(user.id);
+          db.prepare('DELETE FROM password_resets WHERE user_id=?').run(user.id);
+          audit(db, user, 'user.password', user.id);
+        });
+        clearAttempts();
+        const freshUser = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
+        session(req, res, freshUser);
+        return send(res, 200, { ok: true });
       }
       requireThat(!user.must_change_password, 403, 'Change your temporary password before accessing your dashboard.');
       if (path === '/api/directory' && method === 'GET') return send(res, 200, db.prepare('SELECT id,name,appointment FROM users WHERE role=? AND active=1 AND directorate=? AND id!=? ORDER BY name').all('staff', user.directorate, user.id));
@@ -165,19 +164,25 @@ export function createApp({ dbPath = fileURLToPath(new URL('../data/dsa.sqlite',
             requireThat(!pending.some(a => a.ownerId === id || a.fields.relieverId === id || (old.role !== 'staff' && old.role !== 'admin' && (old.role === 'doa' || old.directorate === a.directorate))), 409, 'Resolve or archive pending applications before changing this account’s role, directorate or active status.');
           }
           const password = input.password ? hashPassword(input.password) : old?.password; requireThat(password, 400, 'A password is required for a new account.');
-          const email = emailAddress(input.email ?? old?.email, !old);
+          const email = emailAddress(input.email, true);
           const emailOwner = email ? db.prepare('SELECT id FROM users WHERE lower(email)=?').get(email) : null;
           requireThat(!emailOwner || emailOwner.id === id, 409, 'This email address is already registered to another account.');
           const mustChange = !old || input.password ? 1 : old.must_change_password;
           const next = { id: id || randomUUID(), username, name, role, directorate, appointment, rank, active, email, must_change_password: mustChange };
           db.prepare('INSERT INTO users(id,username,password,name,role,directorate,appointment,rank,active) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET username=excluded.username,password=excluded.password,name=excluded.name,role=excluded.role,directorate=excluded.directorate,appointment=excluded.appointment,rank=excluded.rank,active=excluded.active').run(next.id, username, password, name, role, directorate, appointment, rank, active);
-          if (id) db.prepare('DELETE FROM sessions WHERE user_id=?').run(id);
+          if (id) {
+            db.prepare('DELETE FROM sessions WHERE user_id=?').run(id);
+            db.prepare('DELETE FROM password_resets WHERE user_id=?').run(id);
+          }
           db.prepare('UPDATE users SET email=?,must_change_password=? WHERE id=?').run(email, mustChange, next.id);
-          if (id) db.prepare('DELETE FROM password_resets WHERE user_id=?').run(id);
-          audit(db, user, old ? 'user.update' : 'user.create', next.id, `${name} — ${ROLES[role]}`); return next;
+          audit(db, user, old ? 'user.update' : 'user.create', next.id, `${name} — ${ROLES[role]}`);
+          return next;
         });
-        if (updated.id === user.id) session(req, res, updated);
-        return send(res, method === 'POST' ? 201 : 200, updated);
+        if (id === user.id) {
+          const freshAdmin = db.prepare('SELECT * FROM users WHERE id=?').get(user.id);
+          session(req, res, freshAdmin);
+        }
+        return send(res, method === 'POST' ? 201 : 200, publicUser(updated));
       }
       if (path === '/api/audit' && method === 'GET') { requireThat(user.role === 'admin', 403, 'Administrator access is required.'); return send(res, 200, db.prepare('SELECT * FROM audit ORDER BY id DESC LIMIT 500').all()); }
       if (path === '/api/applications' && method === 'GET') {

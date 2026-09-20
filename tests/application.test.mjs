@@ -3,6 +3,27 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import zlib from 'node:zlib';
+
+function decompressPdfText(pdfBuffer) {
+  let text = pdfBuffer.toString('latin1');
+  const streamRegex = /stream\r?\n([\s\S]*?)\r?\nendstream/g;
+  let match;
+  let decompressedText = text;
+  while ((match = streamRegex.exec(text)) !== null) {
+    try {
+      const buf = Buffer.from(match[1], 'latin1');
+      const uncompressed = zlib.inflateSync(buf).toString('latin1');
+      const decodedTJ = uncompressed.replace(/\[([\s\S]*?)\]\s*TJ/g, (_, content) => {
+        return content
+          .replace(/<([0-9a-fA-F]+)>/g, (__, hex) => Buffer.from(hex, 'hex').toString('latin1'))
+          .replace(/-?\d+(\.\d+)?/g, '');
+      });
+      decompressedText += '\n' + uncompressed + '\n' + decodedTJ;
+    } catch {}
+  }
+  return decompressedText;
+}
 
 test('office workflow enforces ownership, serial signatures, revisions and final PDF access', async t => {
   const mod = await import('../server/app.mjs').catch(() => ({}));
@@ -39,7 +60,7 @@ test('office workflow enforces ownership, serial signatures, revisions and final
   assert.equal((await staff('/users')).status, 403);
   const signature = [[[8, 25], [20, 5], [30, 28], [45, 15], [65, 25]]];
   const fields = { fileNumber: 'DSA/CIV/001', placeOfDeployment: 'Headquarters', description: 'Annual leave', previousDate: '', requestThrough: 'Civilian Head', days: 5, effectiveDate: '2026-10-05', reasons: 'Family commitments', travelPlace: 'Abuja', contactAddress: '12 Office Road, Abuja', station: 'Abuja', department: 'Administration', relieverId: users.reliever.id };
-  let response = await staff('/applications', 'POST', { fields, signature, submit: true });
+  let response = await staff('/applications', 'POST', { fields, signature, confirm: true, submit: true });
   assert.equal(response.status, 201, JSON.stringify(response.data)); let a = response.data;
   assert.equal(a.stage, 'reliever');
   assert.equal((await stranger(`/applications/${a.id}`)).status, 403);
@@ -55,28 +76,51 @@ test('office workflow enforces ownership, serial signatures, revisions and final
   }
   const slip = await staff(`/applications/${a.id}/slip`);
   assert.equal(slip.status, 200); assert.equal(slip.data.subarray(0, 4).toString(), '%PDF');
-  assert.match(slip.data.toString('latin1'), /\/MediaBox \[0 0 419\.53 595\.28\]/, 'Approval slips must be A5 portrait');
-  assert.ok(slip.data.includes(await import('node:fs/promises').then(fs => fs.readFile(new URL('../all-forms/STAMP.jpg', import.meta.url)))), 'The supplied stamp must be embedded in the approval slip');
-  await t.test('standard approval slip fits one page and the form packet fits six forms', async () => {
-    assert.equal((slip.data.toString('latin1').match(/\/Type \/Page\b/g) || []).length, 1, 'The slip must not create a separate footer page');
+  assert.match(slip.data.toString('latin1'), /\/MediaBox \[0 0 595\.28 841\.89\]/, 'Approval slips must be A4 portrait');
+  const stampBuffer = await import('node:fs/promises').then(fs => fs.readFile(new URL('../all-forms/STAMP.jpg', import.meta.url)));
+  assert.ok(!slip.data.includes(stampBuffer), 'The supplied stamp must NOT be embedded in the approval slip');
+  
+  const decompressedText = decompressPdfText(slip.data);
+  assert.match(decompressedText, /Has permission to absent/, 'Must include permission text');
+  assert.match(decompressedText, /nearest medical Officer/, 'Must include sickness instruction');
+  assert.match(decompressedText, /DSA-2026-/, 'Must display reference string on approval slip');
+  
+  await t.test('standard approval slip fits one page and the form packet fits six pages', async () => {
+    assert.equal((slip.data.toString('latin1').match(/\/Type \/Page\b/g) || []).length, 1, 'The slip must not create extra pages');
     const packet = await staff(`/applications/${a.id}/packet`);
-    assert.equal((packet.data.toString('latin1').match(/\/Type \/Page\b/g) || []).length, 6);
+    assert.equal((packet.data.toString('latin1').match(/\/Type \/Page\b/g) || []).length, 6, 'Standard form packet must fit in 6 pages');
   });
   assert.equal((await stranger(`/applications/${a.id}/slip`)).status, 403);
   assert.equal((await staff(`/applications/${a.id}/packet`)).status, 200);
-  let correction = (await staff('/applications', 'POST', { fields, signature, submit: true })).data;
+  let correction = (await staff('/applications', 'POST', { fields, signature, confirm: true, submit: true })).data;
   correction = (await reliever(`/applications/${correction.id}/actions`, 'POST', { version: correction.version, action: 'approve', signature, comment: 'Confirmed' })).data;
   correction = (await head(`/applications/${correction.id}/actions`, 'POST', { version: correction.version, action: 'return', signature, comment: 'Correct the travel destination' })).data;
   assert.equal(correction.stage, 'returned');
-  correction = (await staff(`/applications/${correction.id}`, 'PUT', { version: correction.version, fields: { ...fields, travelPlace: 'Lagos' }, signature, submit: true })).data;
+  correction = (await staff(`/applications/${correction.id}`, 'PUT', { version: correction.version, fields: { ...fields, travelPlace: 'Lagos' }, signature, confirm: true, submit: true })).data;
   assert.equal(correction.stage, 'reliever'); assert.equal(correction.revision, 2); assert.equal(correction.approvals.length, 1); assert.ok(correction.history.length >= 4);
-  assert.equal((await staff(`/applications/${a.id}`, 'PUT', { version: a.version, fields, signature, submit: true })).status, 409);
-  assert.equal((await staff('/applications', 'POST', { fields: { ...fields, relieverId: users.staff.id }, signature, submit: true })).status, 400);
-  assert.equal((await staff('/applications', 'POST', { fields: { ...fields, days: -2 }, signature, submit: true })).status, 400);
+  assert.equal((await staff(`/applications/${a.id}`, 'PUT', { version: a.version, fields, signature, confirm: true, submit: true })).status, 409);
+  assert.equal((await staff('/applications', 'POST', { fields: { ...fields, relieverId: users.staff.id }, signature, confirm: true, submit: true })).status, 400);
+  assert.equal((await staff('/applications', 'POST', { fields: { ...fields, days: -2 }, signature, confirm: true, submit: true })).status, 400);
+  
+  await t.test('draft saves enforce reliever validation if relieverId is provided', async () => {
+    const invalidDraft = await staff('/applications', 'POST', { fields: { ...fields, relieverId: users.stranger.id }, submit: false });
+    assert.equal(invalidDraft.status, 400);
+  });
+  await t.test('submitting without explicit confirmation boolean fails', async () => {
+    const unconfirmed = await staff('/applications', 'POST', { fields, signature, submit: true });
+    assert.equal(unconfirmed.status, 400);
+  });
+  await t.test('blank signature with zero movement fails', async () => {
+    const zeroSig = [[[10, 10], [10, 10], [10, 10]]];
+    const invalidSig = await staff('/applications', 'POST', { fields, signature: zeroSig, confirm: true, submit: true });
+    assert.equal(invalidSig.status, 400);
+  });
+  
   const archived = await admin(`/applications/${a.id}/archive`, 'POST', { version: a.version, reason: 'Duplicate record' });
   assert.equal(archived.status, 200); assert.equal((await staff(`/applications/${a.id}/slip`)).status, 409);
   assert.equal((await admin('/audit')).status, 200);
   assert.equal((await staff('/logout', 'POST', {})).status, 200); assert.equal((await staff('/me')).status, 401);
+  
   await t.test('rejects unknown roles even when they match Object prototype properties', async () => {
     const result = await admin('/users', 'POST', { username: 'bad.role', name: 'Invalid role', role: 'constructor', directorate: 'Administration', appointment: 'Not a role', password: 'Office-test-123!' });
     assert.equal(result.status, 400);
@@ -85,13 +129,15 @@ test('office workflow enforces ownership, serial signatures, revisions and final
     for (let i = 0; i < 22; i++) assert.equal((await staff('/login', 'POST', { username: 'staff.office', password: 'Personal-test-456!' })).status, 200);
   });
   await t.test('attachment access follows application access and rejects executable uploads', async () => {
-    const uploaded = await staff('/applications', 'POST', { fields, signature, submit: true, attachment: { name: 'support.pdf', base64: Buffer.from('%PDF-1.4\nQA attachment').toString('base64') } });
+    const uploaded = await staff('/applications', 'POST', { fields, signature, confirm: true, submit: true, attachment: { name: 'support.pdf', base64: Buffer.from('%PDF-1.4\nQA attachment').toString('base64') } });
     assert.equal(uploaded.status, 201);
     const path = `/applications/${uploaded.data.id}/attachments/${uploaded.data.attachment.id}`;
     assert.equal((await staff(path)).status, 200);
     assert.equal((await stranger(path)).status, 403);
-    const invalid = await staff('/applications', 'POST', { fields, signature, submit: true, attachment: { name: 'payload.html', base64: Buffer.from('<script>alert(1)</script>').toString('base64') } });
+    const invalid = await staff('/applications', 'POST', { fields, signature, confirm: true, submit: true, attachment: { name: 'payload.html', base64: Buffer.from('<script>alert(1)</script>').toString('base64') } });
     assert.equal(invalid.status, 400);
+    const exeFile = await staff('/applications', 'POST', { fields, signature, confirm: true, submit: true, attachment: { name: 'malware.exe', base64: Buffer.from('MZ\x90\x00').toString('base64') } });
+    assert.equal(exeFile.status, 400);
   });
   await t.test('a reviewer in another directorate cannot see or sign the application', async () => {
     const foreign = client();
