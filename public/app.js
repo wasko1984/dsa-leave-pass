@@ -32,7 +32,7 @@ const icon = name => `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">$
 const roles = { staff: 'Civilian Staff', head: 'Civilian Head', ao: 'Administrative Officer', dd: 'Deputy Director', director: 'Director', doa: 'Director of Administration', admin: 'Administrator' };
 const stageLabels = { draft: 'Draft', reliever: 'With reliever', head: 'With Civilian Head', ao: 'With AO', dd: 'With Deputy Director', director: 'With Director', doa: 'With DOA', approved: 'Approved', rejected: 'Rejected', returned: 'Returned for correction' };
 const stages = ['applicant', 'reliever', 'head', 'ao', 'dd', 'director', 'doa'];
-const state = { user: null, applications: [], signature: null, current: null, users: [], directorates: [], tab: 'all', filter: '', search: '' };
+const state = { user: null, token: null, applications: [], signature: null, current: null, users: [], directorates: [], tab: 'all', filter: '', search: '' };
 const fmt = (v, time = false) => v ? new Date(v).toLocaleString('en-GB', { timeZone: 'Africa/Lagos', day: '2-digit', month: 'short', year: 'numeric', ...(time ? { hour: '2-digit', minute: '2-digit' } : {}) }) : '—';
 const initials = name => name.split(' ').map(s => s[0]).slice(0, 2).join('').toUpperCase();
 const badge = a => `<span class="badge ${['approved','rejected','returned','draft'].includes(a.stage) ? a.stage : 'pending'}">${e(a.archived ? 'Archived' : stageLabels[a.stage])}</span>`;
@@ -41,9 +41,19 @@ const field = (label, name, value = '', type = 'text', required = true, extra = 
 const select = (label, name, values, value = '', required = true) => `<div class="field"><label class="label" for="${name}">${label}${required ? ' *' : ''}</label><select id="${name}" name="${name}" ${required ? 'required' : ''}>${values.map(([val, text]) => `<option value="${e(val)}" ${value === val ? 'selected' : ''}>${e(text)}</option>`).join('')}</select></div>`;
 function toast(message) { $('#toast').textContent = message; $('#toast').classList.add('visible'); clearTimeout(state.toastTimer); state.toastTimer = setTimeout(() => $('#toast').classList.remove('visible'), 4500); }
 async function api(path, method = 'GET', data) {
-  const r = await fetch('/api' + path, { method, headers: { 'Content-Type': 'application/json' }, body: data === undefined ? undefined : JSON.stringify(data) });
+  const headers = { 'Content-Type': 'application/json' };
+  if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  const r = await fetch('/api' + path, { method, headers, body: data === undefined ? undefined : JSON.stringify(data) });
   const result = await r.json();
-  if (!r.ok) { if (r.status === 401 && state.user) { state.user = null; login(false); } throw new Error(result.error || 'The request could not be completed.'); }
+  if (!r.ok) {
+    if (r.status === 401 && state.user) {
+      state.user = null;
+      state.token = null;
+      try { localStorage.removeItem('dsa_token'); } catch {}
+      login(false);
+    }
+    throw new Error(result.error || 'The request could not be completed.');
+  }
   return result;
 }
 function dispose() { state.signature?.destroy(); state.signature = null; }
@@ -159,7 +169,15 @@ async function route() {
     window.scrollTo(0,0);
   } catch (error) { toast(error.message); if (state.user) shell(heading('Unable to open this page',e(error.message),'<a class="btn" href="#dashboard">Back to overview</a>')); }
 }
-async function signedIn(user) { state.user = user; location.hash = 'dashboard'; await route(); }
+async function signedIn(user) {
+  state.user = user;
+  if (user.token) {
+    state.token = user.token;
+    try { localStorage.setItem('dsa_token', user.token); } catch {}
+  }
+  location.hash = 'dashboard';
+  await route();
+}
 function formError(form,error) { const target = form.querySelector('.form-error'); if (target) { target.textContent = error.message; target.className = 'form-error error'; target.scrollIntoView({ block:'nearest', behavior:'smooth' }); } else toast(error.message); }
 document.addEventListener('submit', async ev => {
   const form = ev.target; if (!(form instanceof HTMLFormElement)) return; ev.preventDefault();
@@ -174,10 +192,12 @@ document.addEventListener('submit', async ev => {
     } else if (form.id === 'reset-form') {
       if (data.newPassword !== data.confirmPassword) throw new Error('The new passwords do not match.');
       const result = await api('/reset-password','POST',{token:state.recoveryToken,newPassword:data.newPassword});
-      state.recoveryToken = null; state.user = null; toast(result.message); location.hash = 'login';
+      state.recoveryToken = null; state.user = null; state.token = null; try { localStorage.removeItem('dsa_token'); } catch {} toast(result.message); location.hash = 'login';
     } else if (form.id === 'first-password-form') {
       if (data.newPassword !== data.confirmPassword) throw new Error('The new passwords do not match.');
-      await api('/password','POST',data); const {user} = await api('/me');
+      const res = await api('/password','POST',data);
+      if (res.token) { state.token = res.token; try { localStorage.setItem('dsa_token', res.token); } catch {} }
+      const {user} = await api('/me');
       toast('Your personal password is saved. Welcome to your dashboard.'); await signedIn(user);
     } else if (form.id === 'application-form') {
       const payload = { fields:data, submit:mode === 'submit', signature:state.signature.value(), version:state.current?.version };
@@ -193,7 +213,7 @@ document.addEventListener('submit', async ev => {
     } else if (form.id === 'user-form') {
       const id = form.dataset.id; const saved = await api('/users' + (id ? '/' + id : ''), id ? 'PUT' : 'POST', { ...data, active:data.active === 'true' }); if (saved.id === state.user.id) state.user = saved; $('#user-dialog').close(); toast(id ? 'Account updated.' : 'Account created. Share the username and password directly with this person.'); await route();
     } else if (form.id === 'directorate-form') { await api('/directorates','POST',data); toast('Directorate added.'); await route(); }
-    else if (form.id === 'password-form') { if (data.newPassword !== data.confirmPassword) throw new Error('The new passwords do not match.'); await api('/password','POST',data); form.reset(); toast('Password updated. Other sessions have been signed out.'); }
+    else if (form.id === 'password-form') { if (data.newPassword !== data.confirmPassword) throw new Error('The new passwords do not match.'); const res = await api('/password','POST',data); if (res.token) { state.token = res.token; try { localStorage.setItem('dsa_token', res.token); } catch {} } form.reset(); toast('Password updated. Other sessions have been signed out.'); }
   } catch (error) { formError(form,error); }
   finally { buttons.forEach(b => b.disabled = false); }
 });
@@ -202,7 +222,7 @@ document.addEventListener('click', async ev => {
   try {
     switch (target.dataset.action) {
       case 'toggle-password': { const input = $('#password'); input.type = input.type === 'password' ? 'text' : 'password'; target.setAttribute('aria-label',input.type === 'password' ? 'Show password' : 'Hide password'); break; }
-      case 'logout': await api('/logout','POST',{}); state.user = null; state.applications = []; location.hash = ''; login(false); break;
+      case 'logout': await api('/logout','POST',{}); state.user = null; state.token = null; try { localStorage.removeItem('dsa_token'); } catch {} state.applications = []; location.hash = ''; login(false); break;
       case 'menu': $('.shell').classList.toggle('menu-open'); break;
       case 'clear-signature': state.signature?.clear(); break;
       case 'tab': state.tab = target.dataset.value; applications(false); break;
@@ -220,7 +240,21 @@ document.addEventListener('change',ev => { if (ev.target.id === 'status-filter')
 window.addEventListener('hashchange', () => { state.tab = 'all'; state.filter = ''; state.search = ''; route(); });
 async function init() {
   if (location.hash.startsWith('#reset-password') || location.hash.startsWith('#forgot-password')) return recoveryScreen();
-  try { const setup = await api('/setup'); if (setup.required) return login(true); try { const { user } = await api('/me'); state.user = user; await route(); } catch { login(false); } }
-  catch (error) { $('#app').innerHTML = `<div class="initial-loading"><div><h2>Unable to connect</h2><p>${e(error.message)}</p><a class="btn" href="/">Try again</a></div></div>`; }
+  try {
+    try { state.token = localStorage.getItem('dsa_token'); } catch {}
+    const setup = await api('/setup');
+    if (setup.required) return login(true);
+    try {
+      const { user } = await api('/me');
+      state.user = user;
+      await route();
+    } catch {
+      state.token = null;
+      try { localStorage.removeItem('dsa_token'); } catch {}
+      login(false);
+    }
+  } catch (error) {
+    $('#app').innerHTML = `<div class="initial-loading"><div><h2>Unable to connect</h2><p>${e(error.message)}</p><a class="btn" href="/">Try again</a></div></div>`;
+  }
 }
 init();
