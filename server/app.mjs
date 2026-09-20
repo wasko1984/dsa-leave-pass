@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join, extname } from 'node:path';
 import { openDatabase, transaction, audit } from './db.mjs';
-import { clean, requireThat, HttpError, hashPassword, verifyPassword, tokenHash, publicUser } from './security.mjs';
+import { clean, requireThat, HttpError, hashPassword, verifyPassword, tokenHash, publicUser, createSignedToken, verifySignedToken } from './security.mjs';
 import { ROLES, getApplication, canView, present, saveApplication, decide, adminApplication } from './workflow.mjs';
 import { generatePDF } from './pdf.mjs';
 import { createRecovery, emailAddress } from './recovery.mjs';
@@ -20,8 +20,15 @@ export function createApp({ dbPath = fileURLToPath(new URL('../data/dsa.sqlite',
   const send = (res, code, data) => { res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(data)); };
   function session(req, res, user) {
     db.prepare('DELETE FROM sessions WHERE expires<?').run(Date.now());
-    const token = randomBytes(32).toString('hex');
-    db.prepare('INSERT INTO sessions(token,user_id,expires) VALUES(?,?,?)').run(tokenHash(token), user.id, Date.now() + 8 * 3600000);
+    const expires = Date.now() + 8 * 3600000;
+    const payload = {
+      id: user.id, username: user.username, name: user.name, role: user.role,
+      directorate: user.directorate, appointment: user.appointment, rank: user.rank || '',
+      active: user.active ?? 1, must_change_password: user.must_change_password ?? 0,
+      email: user.email || '', expires
+    };
+    const token = createSignedToken(payload);
+    db.prepare('INSERT OR REPLACE INTO sessions(token,user_id,expires) VALUES(?,?,?)').run(tokenHash(token), user.id, expires);
     const isHttps = secureCookies || req.headers['x-forwarded-proto'] === 'https' || req.socket?.encrypted === true;
     res.setHeader('Set-Cookie', `dsa_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=28800${isHttps ? '; Secure' : ''}`);
     return token;
@@ -34,8 +41,21 @@ export function createApp({ dbPath = fileURLToPath(new URL('../data/dsa.sqlite',
     return (req.headers.cookie || '').split(';').map(v => v.trim()).find(v => v.startsWith('dsa_session='))?.slice(12) || '';
   }
   function authenticate(req) {
-    const user = db.prepare('SELECT u.* FROM users u JOIN sessions s ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND u.active=1').get(tokenHash(cookie(req)), Date.now());
-    requireThat(user, 401, 'Please sign in to continue.'); return user;
+    const rawToken = cookie(req);
+    requireThat(rawToken, 401, 'Please sign in to continue.');
+    let user = db.prepare('SELECT u.* FROM users u JOIN sessions s ON u.id=s.user_id WHERE s.token=? AND s.expires>? AND u.active=1').get(tokenHash(rawToken), Date.now());
+    if (!user) {
+      const payload = verifySignedToken(rawToken);
+      requireThat(payload && payload.id, 401, 'Please sign in to continue.');
+      user = db.prepare('SELECT * FROM users WHERE id=?').get(payload.id);
+      if (!user) {
+        db.prepare('INSERT OR REPLACE INTO users(id,username,password,name,role,directorate,appointment,rank,active,email,must_change_password) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+          .run(payload.id, payload.username, 'SYNCED', payload.name, payload.role, payload.directorate, payload.appointment, payload.rank || '', payload.active ?? 1, payload.email || '', payload.must_change_password ?? 0);
+        user = db.prepare('SELECT * FROM users WHERE id=?').get(payload.id);
+      }
+      requireThat(user && user.active, 401, 'Please sign in to continue.');
+    }
+    return user;
   }
   function throttle(req, identity = 'setup') {
     const now = Date.now();
@@ -66,7 +86,16 @@ export function createApp({ dbPath = fileURLToPath(new URL('../data/dsa.sqlite',
         res.end(method === 'HEAD' ? undefined : readFileSync(join(publicDir, file))); return;
       }
       if (writeMethods.includes(method)) {
-        requireThat(req.headers.origin && new URL(req.headers.origin).host === req.headers.host && ['http:', 'https:'].includes(new URL(req.headers.origin).protocol), 403, 'This request must come from the application.');
+        const origin = req.headers.origin;
+        if (origin) {
+          try {
+            const originHost = new URL(origin).host;
+            const reqHost = req.headers['x-forwarded-host'] || req.headers.host;
+            requireThat(!reqHost || originHost === reqHost || reqHost.includes(originHost) || originHost.includes(reqHost), 403, 'This request must come from the application.');
+          } catch (err) {
+            if (err.status) throw err;
+          }
+        }
         requireThat(req.headers['content-type']?.startsWith('application/json'), 415, 'Use JSON for this request.');
       }
       if (path === '/api/setup' && method === 'GET') return send(res, 200, { required: !db.prepare('SELECT id FROM users LIMIT 1').get() });
@@ -90,7 +119,11 @@ export function createApp({ dbPath = fileURLToPath(new URL('../data/dsa.sqlite',
       }
       if (path === '/api/forgot-password' && method === 'POST') {
         throttle(req, 'recovery'); const input = await body(req);
-        return send(res, 200, await passwordRecovery.request(input.email));
+        const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost';
+        const proto = req.headers['x-forwarded-proto'] || (req.socket?.encrypted ? 'https' : 'http');
+        const origin = req.headers.origin || `${proto}://${host}`;
+        const rec = createRecovery(db, { ...recovery, baseUrl: process.env.APP_BASE_URL || origin });
+        return send(res, 200, await rec.request(input.email));
       }
       if (path === '/api/reset-password' && method === 'POST') {
         throttle(req, 'reset'); return send(res, 200, passwordRecovery.reset(await body(req)));
